@@ -4,7 +4,7 @@ import {
   Plus, Trash2, Search, Package, Store, AlertTriangle, Download,
   TrendingUp, TrendingDown, Check, RefreshCw, FileText, Warehouse,
   Building2, Timer, Banknote, FileSignature, X, Pencil,
-  Upload, ChevronRight, Users, Settings,
+  Upload, ChevronRight, Users, Settings, ClipboardCheck,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import {
@@ -54,6 +54,7 @@ const DEFAULT_ACCOUNTS = {
   arLease: "미수리스료", leaseRevenue: "리스료수익",
   assetCost: "리스자산(취득원가)", payable: "미지급금",
   depExpense: "감가상각비", accDep: "감가상각누계액", disposalLoss: "유형자산처분손실",
+  reimbAR: "미수금(변상)",
 };
 const DEFAULT_CURRENCIES = [
   { code: "KRW", name: "원", symbol: "₩", quoteUnit: 1, base: true },
@@ -92,6 +93,7 @@ function computeInventory(items, transactions) {
     else if (t.type === "return") { dec(t.fromStoreId); inc(t.toStoreId || WAREHOUSE); }
     else if (t.type === "transfer") { dec(t.fromStoreId); inc(t.toStoreId); }
     else if (t.type === "scrap") { dec(t.fromStoreId || WAREHOUSE); }
+    else if (t.type === "adjust") { inc(t.toStoreId || WAREHOUSE); }
   }
   return inv;
 }
@@ -122,8 +124,10 @@ function tagDaysDetail(stores, transactions, period) {
     else if (t.type === "return") push(t.fromStoreId, t.itemId, t.date, -q);
     else if (t.type === "transfer") { push(t.fromStoreId, t.itemId, t.date, -q); push(t.toStoreId, t.itemId, t.date, +q); }
     else if (t.type === "scrap") push(t.fromStoreId, t.itemId, t.date, -q);
+    else if (t.type === "adjust") push(t.toStoreId, t.itemId, t.date, +q);
   }
   const detail = {}; // { customerId: { itemId: { store, cwh } } }
+  const byLoc = {};  // { customerId: { locId: { kind, items: { itemId: days } } } } — 매장별 명세용
   for (const k in ev) {
     const sep = k.lastIndexOf("|");
     const loc = k.slice(0, sep), itemId = k.slice(sep + 1);
@@ -144,8 +148,11 @@ function tagDaysDetail(stores, transactions, period) {
     if (!detail[c]) detail[c] = {};
     if (!detail[c][itemId]) detail[c][itemId] = { store: 0, cwh: 0 };
     detail[c][itemId][lc.kind] += days;
+    if (!byLoc[c]) byLoc[c] = {};
+    if (!byLoc[c][loc]) byLoc[c][loc] = { kind: lc.kind, items: {} };
+    byLoc[c][loc].items[itemId] = (byLoc[c][loc].items[itemId] || 0) + days;
   }
-  return detail;
+  return { detail, byLoc };
 }
 
 /* ---------- 그 달 유효 계약 ---------- */
@@ -159,7 +166,7 @@ function isActiveContract(c, period) {
 }
 
 /* ---------- 회계 (운용리스) ---------- */
-function periodAccounting(items, stores, customers, contracts, transactions, period, currencies = DEFAULT_CURRENCIES, fxRates = {}) {
+function periodAccounting(items, stores, customers, contracts, transactions, period, currencies = DEFAULT_CURRENCIES, fxRates = {}, claims = []) {
   let depExpense = 0, depAccum = 0, assetCost = 0, disposalLoss = 0, scrapCost = 0, scrapAccDep = 0, acquisitionCost = 0;
   const [py, pm] = period.split("-").map(Number);
   const pStart = new Date(py, pm - 1, 1), pEnd = new Date(py, pm, 1); // pEnd: 다음 달 1일(미포함)
@@ -192,9 +199,10 @@ function periodAccounting(items, stores, customers, contracts, transactions, per
     }
   }
   const bookValue = assetCost - depAccum;                            // 장부가액(순액)
-  const detail = tagDaysDetail(stores, transactions, period);
+  const { detail, byLoc } = tagDaysDetail(stores, transactions, period);
   const itemMap = Object.fromEntries(items.map((i) => [i.id, i]));
   const custMap = Object.fromEntries(customers.map((c) => [c.id, c]));
+  const storeMap = Object.fromEntries(stores.map((s) => [s.id, s]));
   const billItems = []; // 계약 단위 청구
   let leaseIncome = 0;
   for (const ct of contracts) {
@@ -224,8 +232,23 @@ function periodAccounting(items, stores, customers, contracts, transactions, per
         td += billDays; amountFx += amt;
       }
       lines.sort((a, b) => b.amount - a.amount);
+      const locTd = byLoc[ct.customerId] || {};       // 매장별 명세 (합계는 lines와 동일)
+      const storeLines = [];
+      for (const locId in locTd) {
+        const lc = locTd[locId];
+        if (excl && lc.kind === "cwh") continue;       // 창고 제외 계약이면 보관분 스킵
+        const sName = lc.kind === "cwh" ? `${cust.name} 창고` : (storeMap[locId]?.name || locId);
+        for (const itemId in lc.items) {
+          const it = itemMap[itemId]; if (!it) continue;
+          const days = lc.items[itemId];
+          if (!days) continue;
+          const rate = Number((ct.rates || {})[itemId]) || 0;
+          storeLines.push({ storeId: locId, storeName: sName, kind: lc.kind, item: it, tagDays: days, dailyRate: rate, amount: days * rate });
+        }
+      }
+      storeLines.sort((a, b) => a.storeName.localeCompare(b.storeName) || b.amount - a.amount);
       const fx = toKRW(amountFx, currency, period, currencies, fxRates);
-      billItems.push({ contract: ct, customer: cust, billing: "usage", currency, amountFx, amount: fx.krw, rate: fx.rate, missingFx: !fx.ok, tagDays: td, lines, missingRate, excludeStorage: excl, cwhExcluded });
+      billItems.push({ contract: ct, customer: cust, billing: "usage", currency, amountFx, amount: fx.krw, rate: fx.rate, missingFx: !fx.ok, tagDays: td, lines, storeLines, missingRate, excludeStorage: excl, cwhExcluded });
       leaseIncome += fx.krw;
     }
   }
@@ -257,8 +280,10 @@ function periodAccounting(items, stores, customers, contracts, transactions, per
   const allocatedCost = Object.values(custCost).reduce((a, b) => a + b, 0);
   const unallocatedCost = depExpense - allocatedCost;
 
-  return { depExpense, depAccum, assetCost, bookValue, disposalLoss, scrapCost, scrapAccDep, acquisitionCost, itemBook,
-    leaseIncome, netIncome: leaseIncome - depExpense - disposalLoss,
+  const reimbClaims = (claims || []).filter((cl) => (cl.date || "").slice(0, 7) === period);
+  const reimbAR = reimbClaims.reduce((a, cl) => a + (Number(cl.total) || 0), 0);
+  return { depExpense, depAccum, assetCost, bookValue, disposalLoss, scrapCost, scrapAccDep, acquisitionCost, itemBook, reimbAR, reimbClaims,
+    leaseIncome, netIncome: leaseIncome - depExpense - disposalLoss + reimbAR,
     billItems, custPL, allocatedCost, unallocatedCost };
 }
 
@@ -277,6 +302,9 @@ function buildJournal(acc, period, accounts) {
     debit: { account: A.accDep, amount: acc.scrapAccDep || 0 }, credit: { account: A.assetCost, amount: acc.scrapAccDep || 0 } });
   lines.push({ memo: `리스자산 폐기 — 처분손실 (잔존 장부가)`,
     debit: { account: A.disposalLoss, amount: acc.disposalLoss || 0 }, credit: { account: A.assetCost, amount: acc.disposalLoss || 0 } });
+  if (acc.reimbAR > 0)
+    lines.push({ memo: `리스자산 분실 변상청구 (잔존가 · 미수금)`,
+      debit: { account: A.reimbAR, amount: acc.reimbAR }, credit: { account: A.disposalLoss, amount: acc.reimbAR } });
   return lines;
 }
 
@@ -487,13 +515,13 @@ export default function LeaseManager() {
     } catch (e) { flash("저장 실패 — 네트워크를 확인해 주세요"); }
   }, []);
 
-  const { customers, items, stores, contracts, transactions, currencies, fxRates } = data;
+  const { customers, items, stores, contracts, transactions, currencies, fxRates, claims } = data;
   const storeMap = useMemo(() => Object.fromEntries(stores.map((s) => [s.id, s])), [stores]);
   const custMap = useMemo(() => Object.fromEntries(customers.map((c) => [c.id, c])), [customers]);
   const itemMap = useMemo(() => Object.fromEntries(items.map((i) => [i.id, i])), [items]);
   const inventory = useMemo(() => computeInventory(items, transactions), [items, transactions]);
-  const acc = useMemo(() => periodAccounting(items, stores, customers, contracts, transactions, period, currencies, fxRates),
-    [items, stores, customers, contracts, transactions, period, currencies, fxRates]);
+  const acc = useMemo(() => periodAccounting(items, stores, customers, contracts, transactions, period, currencies, fxRates, claims || []),
+    [items, stores, customers, contracts, transactions, period, currencies, fxRates, claims]);
 
   const totalTags = useMemo(() => items.reduce((s, i) => s + (Number(i.acquiredQty) || 0), 0), [items]);
   const issuedTags = useMemo(() => {
@@ -512,6 +540,7 @@ export default function LeaseManager() {
     { id: "dash", label: "대시보드", icon: LayoutDashboard },
     { id: "stock", label: "재고현황", icon: Boxes },
     { id: "txn", label: "입출고", icon: ArrowLeftRight },
+    { id: "stock", label: "재고실사", icon: ClipboardCheck },
     { id: "master", label: "마스터", icon: Database },
     { id: "acct", label: "회계·청구", icon: Calculator },
     { id: "settings", label: "설정", icon: Settings },
@@ -559,6 +588,7 @@ export default function LeaseManager() {
             {tab === "dash" && <Dashboard {...{ acc, period, totalTags, issuedTags, data, inventory, storeMap }} />}
             {tab === "stock" && <StockView {...{ items, stores, customers, inventory, storeMap, custMap }} />}
             {tab === "txn" && <TxnView {...{ data, persist, flash, storeMap, custMap, itemMap, inventory, userEmail: session.user?.email }} />}
+            {tab === "stock" && <StocktakeView {...{ data, persist, flash, inventory, storeMap, custMap, userEmail: session.user?.email }} />}
             {tab === "master" && <MasterView {...{ data, persist, flash, custMap, period }} />}
             {tab === "acct" && <AcctView {...{ acc, period, setPeriod, data, persist, flash }} />}
             {tab === "settings" && <SettingsView {...{ data, persist, flash }} />}
@@ -610,7 +640,7 @@ function Dashboard({ acc, period, totalTags, issuedTags, data, inventory, storeM
     for (let i = 11; i >= 0; i--) {
       const d = new Date(base.getFullYear(), base.getMonth() - i, 1);
       const p = d.toISOString().slice(0, 7);
-      const a = periodAccounting(items, stores, customers, contracts, transactions, p, currencies, fxRates);
+      const a = periodAccounting(items, stores, customers, contracts, transactions, p, currencies, fxRates, claims || []);
       let rev, cost, prof;
       if (custSel) {
         const row = a.custPL.find((x) => x.customer.id === custSel);
@@ -1875,6 +1905,249 @@ function CurrencyMaster({ data, persist, flash, period }) {
 }
 
 /* ---------- 회계·청구 ---------- */
+function StocktakeView({ data, persist, flash, inventory, storeMap, custMap, userEmail }) {
+  const items = data.items || [];
+  const stores = data.stores || [];
+  const customers = data.customers || [];
+  const locOptions = useMemo(() => {
+    const opts = [{ id: WAREHOUSE, name: "우리 창고" }];
+    stores.forEach((s) => opts.push({ id: s.id, name: s.name }));
+    customers.forEach((c) => opts.push({ id: cwhId(c.id), name: `${c.name} 창고(보관)` }));
+    return opts;
+  }, [stores, customers]);
+
+  const [loc, setLoc] = useState(WAREHOUSE);
+  const [date, setDate] = useState(todayISO());
+  const [counts, setCounts] = useState({});
+  const [viewing, setViewing] = useState(null); // 이력 조회 중인 실사
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const bookRows = useMemo(() => {
+    const rows = [];
+    items.forEach((it) => { const b = (inventory[it.id]?.[loc]) || 0; if (b > 0) rows.push({ item: it, book: b }); });
+    return rows.sort((a, b) => b.book - a.book);
+  }, [items, inventory, loc]);
+
+  useEffect(() => {
+    const init = {};
+    items.forEach((it) => { const b = (inventory[it.id]?.[loc]) || 0; if (b > 0) init[it.id] = String(b); });
+    setCounts(init);
+  }, [loc]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const setCount = (id, v) => setCounts((p) => ({ ...p, [id]: v }));
+  const locName = locOptions.find((o) => o.id === loc)?.name || loc;
+
+  const diffs = bookRows.map((r) => {
+    const raw = counts[r.item.id];
+    const counted = raw === "" || raw == null ? null : Number(raw);
+    const diff = counted == null ? null : counted - r.book;
+    return { ...r, counted, diff };
+  });
+  const shortage = diffs.filter((d) => d.diff != null && d.diff < 0);
+  const surplus = diffs.filter((d) => d.diff != null && d.diff > 0);
+  const shortQty = shortage.reduce((a, d) => a - d.diff, 0);
+  const surpQty = surplus.reduce((a, d) => a + d.diff, 0);
+
+  const save = () => {
+    const lines = bookRows.map((r) => ({ itemId: r.item.id, book: r.book, counted: counts[r.item.id] === "" || counts[r.item.id] == null ? null : Number(counts[r.item.id]) }));
+    const rec = { id: `st_${Date.now()}`, date, locId: loc, locName, lines, status: "draft", createdBy: userEmail || "", createdAt: new Date().toISOString() };
+    persist({ ...data, stocktakes: [rec, ...(data.stocktakes || [])] });
+    flash("재고실사 저장됨 (임시저장)");
+  };
+
+  const custId = loc === WAREHOUSE ? null : isCwh(loc) ? cwhCust(loc) : (storeMap[loc]?.customerId || null);
+  const doConfirm = () => {
+    const pm = (date || todayISO()).slice(0, 7);
+    const newTxns = [], claimLines = [];
+    diffs.forEach((d) => {
+      if (d.diff == null || d.diff === 0) return;
+      if (d.diff < 0) {
+        const qty = -d.diff;
+        newTxns.push({ id: uid(), type: "scrap", date, itemId: d.item.id, qty, fromStoreId: loc, memo: `재고실사 부족 (${locName})`, createdBy: userEmail || "" });
+        if (custId) {
+          const unit = Number(d.item.unitCost) || 0, life = Number(d.item.usefulLifeMonths) || 0;
+          const el = monthsElapsed(d.item.acquiredDate, pm);
+          const bpu = life > 0 ? Math.max(0, unit - (unit / life) * Math.min(el, life)) : unit;
+          claimLines.push({ itemId: d.item.id, code: d.item.code, name: d.item.name, qty, unitBook: bpu, amount: bpu * qty });
+        }
+      } else {
+        newTxns.push({ id: uid(), type: "adjust", date, itemId: d.item.id, qty: d.diff, toStoreId: loc, memo: `재고실사 과잉 (${locName})`, createdBy: userEmail || "" });
+      }
+    });
+    const stId = `st_${Date.now()}`;
+    const claimsArr = [...(data.claims || [])];
+    let claimRec = null;
+    if (custId && claimLines.length) {
+      claimRec = { id: `cl_${Date.now()}`, date, customerId: custId, customerName: custMap[custId]?.name || "", locName, stocktakeId: stId, lines: claimLines, total: claimLines.reduce((a, l) => a + l.amount, 0) };
+      claimsArr.unshift(claimRec);
+    }
+    const lines = bookRows.map((r) => ({ itemId: r.item.id, book: r.book, counted: counts[r.item.id] === "" || counts[r.item.id] == null ? null : Number(counts[r.item.id]) }));
+    const stRec = { id: stId, date, locId: loc, locName, lines, status: "confirmed", claimId: claimRec?.id || null, createdBy: userEmail || "", createdAt: new Date().toISOString(), confirmedAt: new Date().toISOString() };
+    persist({ ...data, transactions: [...(data.transactions || []), ...newTxns], claims: claimsArr, stocktakes: [stRec, ...(data.stocktakes || [])] });
+    setConfirmOpen(false);
+    flash("실사 확정 — 폐기·변상 반영됨");
+  };
+
+  const downloadTemplate = () => {
+    const aoa = [["재고실사 양식"], ["위치", locName], ["실사일자", date], [], ["아이템코드", "아이템명", "장부수량", "실사수량"]];
+    bookRows.forEach((r) => aoa.push([r.item.code, r.item.name, r.book, ""]));
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = [{ wch: 16 }, { wch: 24 }, { wch: 10 }, { wch: 10 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "실사");
+    XLSX.writeFile(wb, `재고실사_${locName}_${date}.xlsx`);
+  };
+
+  const uploadTemplate = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(new Uint8Array(e.target.result), { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const aoa = XLSX.utils.sheet_to_json(ws, { header: 1 });
+        const hi = aoa.findIndex((r) => String(r[0] || "").includes("아이템코드"));
+        if (hi < 0) { flash("양식을 찾을 수 없습니다"); return; }
+        const next = { ...counts }; let n = 0;
+        for (let i = hi + 1; i < aoa.length; i++) {
+          const code = String(aoa[i][0] || "").trim(); const cnt = aoa[i][3];
+          if (!code) continue;
+          const it = items.find((x) => x.code === code);
+          if (it && cnt !== "" && cnt != null && !isNaN(Number(cnt))) { next[it.id] = String(Number(cnt)); n++; }
+        }
+        setCounts(next);
+        flash(`실사수량 ${n}건 불러옴`);
+      } catch (err) { flash("엑셀 읽기 실패"); }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const fmtDate = (s) => { try { return new Date(s).toLocaleDateString("ko-KR", { year: "2-digit", month: "2-digit", day: "2-digit" }); } catch { return s; } };
+  const history = data.stocktakes || [];
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <h2 className="text-base font-bold mb-1">재고실사</h2>
+        <p className="text-[11px] text-slate-400 mb-4">위치별 장부수량과 실물(실사)을 대조합니다. 실사수량을 직접 입력하거나 엑셀 양식으로 일괄 입력하세요.</p>
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-xs text-slate-500">위치
+            <select value={loc} onChange={(e) => { setLoc(e.target.value); setViewing(null); }} className="mt-1 block rounded-lg ring-1 ring-slate-300 px-2 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 max-w-[200px]">
+              {locOptions.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+            </select>
+          </label>
+          <label className="text-xs text-slate-500">실사일자
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="mt-1 block rounded-lg ring-1 ring-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+          </label>
+          <Btn onClick={downloadTemplate}><Download size={15} /> 엑셀 양식</Btn>
+          <label className="inline-flex items-center gap-1.5 rounded-lg ring-1 ring-slate-300 px-3 py-1.5 text-sm cursor-pointer hover:bg-slate-50">
+            <Upload size={15} /> 엑셀 업로드
+            <input type="file" accept=".xlsx,.xls" className="hidden" onChange={(e) => { uploadTemplate(e.target.files[0]); e.target.value = ""; }} />
+          </label>
+        </div>
+      </Card>
+
+      <div className="grid grid-cols-3 gap-3">
+        <BizStat label="실사 품목" value={`${fmt(bookRows.length)}종`} tone="slate" />
+        <BizStat label="부족 (분실·파손)" value={`${fmt(shortQty)}개`} tone="rose" />
+        <BizStat label="과잉" value={`${fmt(surpQty)}개`} tone="amber" />
+      </div>
+
+      <Card className="overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between">
+          <h3 className="text-sm font-bold">{locName} · 장부 vs 실사</h3>
+          <div className="flex gap-2">
+            <Btn onClick={save}>임시저장</Btn>
+            <Btn tone="primary" onClick={() => setConfirmOpen(true)} disabled={shortage.length === 0 && surplus.length === 0}><Check size={15} /> 실사 확정</Btn>
+          </div>
+        </div>
+        {bookRows.length === 0 ? (
+          <p className="text-sm text-slate-400 text-center py-10">이 위치에 장부상 재고가 없습니다.</p>
+        ) : (
+          <div className="overflow-x-auto max-h-[55vh]">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-slate-50 text-slate-500 text-xs text-left">
+                <tr><th className="px-4 py-2 font-medium">아이템</th><th className="px-4 py-2 font-medium text-right">장부</th>
+                  <th className="px-4 py-2 font-medium text-right">실사</th><th className="px-4 py-2 font-medium text-right">차이</th></tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {diffs.map((d) => (
+                  <tr key={d.item.id} className={d.diff ? (d.diff < 0 ? "bg-rose-50/40" : "bg-amber-50/40") : ""}>
+                    <td className="px-4 py-1.5"><span className="font-medium">{d.item.code}</span> <span className="text-slate-500 text-xs">{d.item.name}</span></td>
+                    <td className="px-4 py-1.5 text-right tabular-nums text-slate-500">{fmt(d.book)}</td>
+                    <td className="px-4 py-1.5 text-right">
+                      <input value={counts[d.item.id] ?? ""} onChange={(e) => setCount(d.item.id, e.target.value)} inputMode="numeric"
+                        className="w-20 rounded-md ring-1 ring-slate-200 px-2 py-1 text-sm text-right tabular-nums focus:ring-2 focus:ring-indigo-400 focus:outline-none" />
+                    </td>
+                    <td className={`px-4 py-1.5 text-right tabular-nums font-semibold ${d.diff == null ? "text-slate-300" : d.diff < 0 ? "text-rose-600" : d.diff > 0 ? "text-amber-600" : "text-slate-400"}`}>
+                      {d.diff == null ? "—" : d.diff > 0 ? `+${fmt(d.diff)}` : fmt(d.diff)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {shortage.length > 0 && (
+          <div className="px-4 py-2.5 bg-rose-50 border-t border-rose-100 text-[11px] text-rose-600">
+            부족 {shortage.length}종 {fmt(shortQty)}개 — 확정 시 폐기 처리 및 고객사 변상청구 대상입니다. (다음 단계에서 처리)
+          </div>
+        )}
+      </Card>
+
+      {history.length > 0 && (
+        <Card className="overflow-hidden">
+          <div className="px-4 py-3 border-b border-slate-100"><h3 className="text-sm font-bold">실사 이력</h3></div>
+          <div className="divide-y divide-slate-100">
+            {history.map((h) => {
+              const sh = (h.lines || []).filter((l) => l.counted != null && l.counted < l.book);
+              const shq = sh.reduce((a, l) => a + (l.book - l.counted), 0);
+              return (
+                <div key={h.id} className="px-4 py-2.5 flex items-center justify-between text-sm">
+                  <div>
+                    <span className="font-medium">{h.locName}</span>
+                    <span className="text-slate-400 text-xs ml-2">{fmtDate(h.date)}</span>
+                    {h.status === "draft" && <span className="text-[10px] text-amber-600 ml-2">임시저장</span>}
+                  </div>
+                  <div className="text-xs text-slate-500 tabular-nums">
+                    {sh.length > 0 ? <span className="text-rose-600">부족 {fmt(shq)}개</span> : <span className="text-slate-400">차이 없음</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+      <p className="text-[11px] text-slate-400 px-1">※ 확정 시 부족분은 폐기(자산 제거·처분손실), 매장·고객사창고 부족분은 잔존가액으로 변상청구(미수금)됩니다. 과잉분은 장부 수량이 증가 조정됩니다.</p>
+
+      {confirmOpen && (
+        <div className="fixed inset-0 z-50 bg-black/30 grid place-items-center px-4" onClick={() => setConfirmOpen(false)}>
+          <div className="bg-white rounded-2xl p-5 w-full max-w-md shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <h3 className="font-bold mb-1">재고실사 확정</h3>
+            <p className="text-sm text-slate-500 mb-3">{locName} · {date}</p>
+            <div className="space-y-1.5 text-sm bg-slate-50 rounded-lg p-3 mb-3">
+              {shortage.length > 0 && <div className="flex justify-between"><span className="text-rose-600">부족 → 폐기</span><span className="tabular-nums">{shortage.length}종 {fmt(shortQty)}개</span></div>}
+              {surplus.length > 0 && <div className="flex justify-between"><span className="text-amber-600">과잉 → 장부 증가</span><span className="tabular-nums">{surplus.length}종 {fmt(surpQty)}개</span></div>}
+              {shortage.length === 0 && surplus.length === 0 && <div className="text-slate-400">차이 없음</div>}
+            </div>
+            <p className="text-[11px] text-slate-500 mb-1">확정하면:</p>
+            <ul className="text-[11px] text-slate-500 list-disc pl-4 space-y-0.5 mb-3">
+              <li>부족분은 <b>폐기 거래</b>로 자산에서 제거되고 처분손실이 인식됩니다</li>
+              {custId ? <li>이 위치 부족분은 <b>잔존가액으로 변상청구</b>(미수금)됩니다</li> : <li className="text-slate-400">우리 창고 분실은 변상청구 대상이 아닙니다</li>}
+              <li>과잉분은 장부 수량이 증가 조정됩니다</li>
+            </ul>
+            <p className="text-[11px] text-rose-500 mb-4">※ 확정 후에는 거래로 반영되어, 되돌리려면 입출고에서 수동 조정해야 합니다.</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setConfirmOpen(false)} className="text-sm rounded-lg ring-1 ring-slate-300 px-3 py-1.5 hover:bg-slate-50">취소</button>
+              <button onClick={doConfirm} className="text-sm rounded-lg bg-rose-600 text-white px-3 py-1.5 font-semibold hover:bg-rose-700">확정</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AcctView({ acc, period, setPeriod, data, persist, flash }) {
   const [expanded, setExpanded] = useState({});
   const toggleExp = (id) => setExpanded((e) => ({ ...e, [id]: !e[id] }));
@@ -1888,6 +2161,12 @@ function AcctView({ acc, period, setPeriod, data, persist, flash }) {
   const closed = (data.closedPeriods || []).includes(period);
   const close = () => { if (closed) return; persist({ ...data, closedPeriods: [...(data.closedPeriods || []), period] }); flash(`${period} 마감 완료`); };
   const reopen = () => persist({ ...data, closedPeriods: (data.closedPeriods || []).filter((p) => p !== period) });
+
+  const [claimUnpaidOnly, setClaimUnpaidOnly] = useState(true);
+  const toggleClaimPaid = (id) => {
+    const claims = (data.claims || []).map((c) => c.id === id ? { ...c, paid: !c.paid, paidDate: !c.paid ? todayISO() : null } : c);
+    persist({ ...data, claims });
+  };
 
   const exportBilling = () => {
     const rows = [["고객사", "계약번호", "통화", "과금방식", "태그코드", "tag-day(q×일수)", "일당단가(외화)", "금액(외화)", "금액(KRW)"]];
@@ -1918,12 +2197,18 @@ function AcctView({ acc, period, setPeriod, data, persist, flash }) {
       sup.addr ? `<div>${escH(sup.addr)}</div>` : "",
       sup.tel ? `<div>TEL ${escH(sup.tel)}</div>` : "",
     ].join("");
-    const rows = bills.map((b) => {
-      const desc = b.billing === "flat" ? "월정액" : `사용량 (tag-day ${fmt1(b.tagDays)})`;
-      const fxd = b.currency !== "KRW"
-        ? `<div class="sub">${escH(b.currency)} ${fmt(Math.round(b.amountFx))}${b.missingFx ? " · 환율미입력" : ""}</div>`
-        : (b.missingFx ? `<div class="sub warn">환율미입력</div>` : "");
-      return `<tr><td>${escH(b.contract.contractNo)}</td><td>${desc}</td><td class="r">${wonH(b.amount)}${fxd}</td></tr>`;
+    const cunit = (c, n) => (c === "KRW" ? "₩" : escH(c) + " ") + fmt(Math.round(n));
+    const blocks = bills.map((b) => {
+      if (b.billing === "flat") {
+        return `<tr class="grp"><td colspan="4">${escH(b.contract.contractNo)} · 월정액</td><td class="r b">${cunit(b.currency, b.amountFx)}${b.missingFx ? ' <span class="warn">환율미입력</span>' : ""}</td></tr>`;
+      }
+      const sl = b.storeLines || [];
+      const head = `<tr class="grp"><td colspan="5">${escH(b.contract.contractNo)} · 사용량 (${escH(b.currency)})${b.missingRate ? ' <span class="warn">단가 미설정 태그</span>' : ""}</td></tr>`;
+      const rows = sl.length
+        ? sl.map((ln) => `<tr><td>${escH(ln.storeName)}</td><td>${escH(ln.item.code)} ${escH(ln.item.name)}</td><td class="r">${fmt1(ln.tagDays)}</td><td class="r">${ln.dailyRate > 0 ? cunit(b.currency, ln.dailyRate) : '<span class="warn">미설정</span>'}</td><td class="r">${cunit(b.currency, ln.amount)}</td></tr>`).join("")
+        : `<tr><td colspan="5" class="sub2">사용 내역 없음</td></tr>`;
+      const sub = `<tr class="subr"><td colspan="4" class="r">소계</td><td class="r b">${cunit(b.currency, b.amountFx)}${b.currency !== "KRW" ? ` <span class="sub2">→ ${wonH(b.amount)}</span>` : ""}</td></tr>`;
+      return head + rows + sub;
     }).join("");
     return `<section class="inv">
       <div class="head"><div class="ttl">청 구 서</div><div class="per">${escH(period)}</div></div>
@@ -1934,11 +2219,11 @@ function AcctView({ acc, period, setPeriod, data, persist, flash }) {
           ${rc.recipientTel ? `<div class="sub">${escH(rc.recipientTel)}</div>` : ""}</div>
         <div class="from">${supLines || '<div class="sub">공급자 정보 미입력 (설정 탭에서 입력)</div>'}</div>
       </div>
-      <table class="tbl"><thead><tr><th>계약번호</th><th>내역</th><th class="r">청구금액</th></tr></thead>
-        <tbody>${rows}</tbody>
-        <tfoot><tr><td colspan="2" class="r b">합계 (KRW)</td><td class="r b">${wonH(totalKRW)}</td></tr></tfoot></table>
+      <table class="tbl"><thead><tr><th>매장</th><th>아이템</th><th class="r">tag-day</th><th class="r">일당단가</th><th class="r">금액</th></tr></thead>
+        <tbody>${blocks}</tbody>
+        <tfoot><tr><td colspan="4" class="r b">합계 (KRW)</td><td class="r b">${wonH(totalKRW)}</td></tr></tfoot></table>
       ${cwhExcl > 0 ? `<div class="note">※ 고객사 창고 보관분 ${fmt1(cwhExcl)} tag-day는 계약 조건에 따라 청구에서 제외되었습니다.</div>` : ""}
-      <div class="foot">본 청구서는 ${escH(period)} 운용리스 이용분에 대한 청구입니다.</div>
+      <div class="foot">본 청구서는 ${escH(period)} 운용리스 이용분에 대한 청구입니다. (tag-day = 수량 × 일수)</div>
     </section>`;
   };
   const printInvoices = (custId) => {
@@ -1959,7 +2244,10 @@ function AcctView({ acc, period, setPeriod, data, persist, flash }) {
         .sub{color:#64748b;font-size:11px} .warn{color:#e11d48}
         .tbl{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
         .tbl th{background:#f1f5f9;text-align:left;padding:8px 10px;font-weight:600;font-size:12px}
-        .tbl td{padding:8px 10px;border-bottom:1px solid #e2e8f0} .tbl .r{text-align:right} .tbl .b{font-weight:700}
+        .tbl td{padding:7px 10px;border-bottom:1px solid #eef2f6} .tbl .r{text-align:right} .tbl .b{font-weight:700}
+        .tbl .grp td{background:#eef2ff;font-weight:700;font-size:11px;border-bottom:1px solid #c7d2fe;color:#3730a3}
+        .tbl .subr td{border-top:1px solid #cbd5e1;border-bottom:2px solid #e2e8f0;font-size:12px;background:#f8fafc}
+        .sub2{color:#94a3b8;font-weight:400;font-size:10px}
         .tbl tfoot td{border-top:2px solid #cbd5e1;border-bottom:none;font-size:14px;padding-top:10px}
         .note{margin-top:12px;font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:8px 10px}
         .foot{margin-top:24px;font-size:11px;color:#94a3b8;text-align:center}
@@ -1967,6 +2255,48 @@ function AcctView({ acc, period, setPeriod, data, persist, flash }) {
       </style></head><body>${pages}</body></html>`;
     const w = window.open("", "_blank");
     if (!w) return flash("팝업이 차단되었습니다. 브라우저에서 팝업을 허용한 뒤 다시 시도하세요.");
+    w.document.write(html); w.document.close();
+    setTimeout(() => { w.focus(); w.print(); }, 350);
+  };
+
+  const printReimburse = () => {
+    const cls = acc.reimbClaims || [];
+    if (!cls.length) return flash("이 달 변상청구 내역이 없습니다");
+    const won = (n) => "₩" + fmt(n);
+    const blocks = cls.map((cl) => {
+      const rows = (cl.lines || []).map((l) => `<tr><td>${escH(l.code)} <span class="sub2">${escH(l.name)}</span></td><td class="r">${fmt(l.qty)}</td><td class="r">${won(l.unitBook)}</td><td class="r">${won(l.amount)}</td></tr>`).join("");
+      return `<table class="tbl"><thead><tr class="grp"><td colspan="4">${escH(cl.customerName)} · ${escH(cl.locName)} <span class="sub2">(${escH(cl.date)})</span></td></tr><tr><th>아이템</th><th class="r">수량</th><th class="r">잔존가(단가)</th><th class="r">변상액</th></tr></thead><tbody>${rows}</tbody><tfoot><tr><td colspan="3" class="r b">소계</td><td class="r b">${won(cl.total)}</td></tr></tfoot></table>`;
+    }).join('<div style="height:14px"></div>');
+    const total = cls.reduce((a, cl) => a + (cl.total || 0), 0);
+    const sup = data.supplier || {};
+    const supLines = [sup.name ? `<div class="supn">${escH(sup.name)}</div>` : "", sup.bizNo ? `<div>사업자등록번호 ${escH(sup.bizNo)}</div>` : "", sup.tel ? `<div>TEL ${escH(sup.tel)}</div>` : ""].join("");
+    const html = `<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>변상청구서 ${escH(period)}</title>
+      <style>
+        *{box-sizing:border-box} body{font-family:-apple-system,'Malgun Gothic','Apple SD Gothic Neo',sans-serif;color:#1e293b;margin:0;padding:24px}
+        .inv{max-width:720px;margin:0 auto}
+        .head{display:flex;justify-content:space-between;align-items:baseline;border-bottom:3px solid #e11d48;padding-bottom:10px}
+        .ttl{font-size:26px;font-weight:800;letter-spacing:6px} .per{font-size:15px;color:#64748b}
+        .from{text-align:right;font-size:12px;line-height:1.6;margin:16px 0} .supn{font-size:15px;font-weight:700}
+        .desc{font-size:12px;color:#64748b;margin:14px 0;line-height:1.6}
+        .tbl{width:100%;border-collapse:collapse;font-size:13px} .tbl .r{text-align:right} .tbl .b{font-weight:700}
+        .tbl th{background:#f1f5f9;text-align:left;padding:8px 10px;font-weight:600;font-size:12px}
+        .tbl td{padding:7px 10px;border-bottom:1px solid #eef2f6}
+        .tbl .grp td{background:#fff1f2;font-weight:700;font-size:12px;color:#9f1239;border-bottom:1px solid #fecdd3}
+        .sub2{color:#94a3b8;font-weight:400;font-size:10px}
+        .tbl tfoot td{border-top:2px solid #cbd5e1;font-size:13px}
+        .tot{margin-top:18px;text-align:right;font-size:16px;font-weight:800}
+        .foot{margin-top:24px;font-size:11px;color:#94a3b8;text-align:center;line-height:1.6}
+        @media print{body{padding:0}}
+      </style></head><body><div class="inv">
+        <div class="head"><div class="ttl">변상 청구서</div><div class="per">${escH(period)}</div></div>
+        <div class="from">${supLines}</div>
+        <div class="desc">아래는 재고실사 결과 분실·미반환으로 확인된 리스자산에 대한 변상 청구입니다. 변상액은 분실 시점의 잔존 장부가액 기준입니다.</div>
+        ${blocks}
+        <div class="tot">변상 청구 합계 &nbsp; ₩${fmt(total)}</div>
+        <div class="foot">본 청구서는 ${escH(period)} 재고실사 기준 분실 리스자산 변상 청구입니다.<br/>변상액 = 분실 수량 × 잔존 장부가액</div>
+      </div></body></html>`;
+    const w = window.open("", "_blank");
+    if (!w) return flash("팝업이 차단되었습니다. 팝업을 허용한 뒤 다시 시도하세요.");
     w.document.write(html); w.document.close();
     setTimeout(() => { w.focus(); w.print(); }, 350);
   };
@@ -1985,6 +2315,7 @@ function AcctView({ acc, period, setPeriod, data, persist, flash }) {
             {billCusts.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
           </select>
           <Btn tone="primary" onClick={() => printInvoices(pdfCust)}><FileText size={15} /> PDF 청구서</Btn>
+          {acc.reimbAR > 0 && <Btn onClick={printReimburse}><FileText size={15} /> 변상 청구서</Btn>}
           <Btn onClick={exportBilling}><Download size={15} /> 청구명세 CSV</Btn>
           {closed ? <Btn onClick={reopen}>마감 취소</Btn> : <Btn tone="primary" onClick={close}><Check size={15} /> 월 마감</Btn>}
         </div>
@@ -1994,6 +2325,7 @@ function AcctView({ acc, period, setPeriod, data, persist, flash }) {
         <Stat label="리스료수익" v={acc.leaseIncome} tone="emerald" />
         <Stat label="감가상각비" v={acc.depExpense} tone="rose" />
         <Stat label="폐기 처분손실" v={acc.disposalLoss} tone="rose" />
+        <Stat label="분실 변상(미수금)" v={acc.reimbAR} tone="slate" />
         <Stat label="리스손익" v={acc.netIncome} tone={acc.netIncome >= 0 ? "emerald" : "rose"} />
         <Stat label="자산 장부가액(순액)" v={acc.bookValue} tone="slate" />
         <Stat label="감가상각누계액" v={acc.depAccum} tone="slate" />
@@ -2068,6 +2400,51 @@ function AcctView({ acc, period, setPeriod, data, persist, flash }) {
         <JournalTable lines={journal} />
       </Card>
 
+      {(data.claims || []).length > 0 && (() => {
+        const claims = data.claims || [];
+        const unpaidTotal = claims.filter((c) => !c.paid).reduce((a, c) => a + (c.total || 0), 0);
+        const paidTotal = claims.filter((c) => c.paid).reduce((a, c) => a + (c.total || 0), 0);
+        const shown = claimUnpaidOnly ? claims.filter((c) => !c.paid) : claims;
+        const fmtD = (s) => { try { return new Date(s).toLocaleDateString("ko-KR", { year: "2-digit", month: "2-digit", day: "2-digit" }); } catch { return s; } };
+        return (
+          <Card className="overflow-hidden">
+            <div className="px-4 py-3 border-b border-slate-100 flex items-center justify-between gap-2 flex-wrap">
+              <h3 className="text-sm font-bold flex items-center gap-1.5"><Banknote size={15} /> 분실 변상 청구 현황 <span className="text-[11px] text-slate-400 font-normal">(전체 기간)</span></h3>
+              <label className="flex items-center gap-1.5 text-xs text-slate-500 cursor-pointer">
+                <input type="checkbox" checked={claimUnpaidOnly} onChange={(e) => setClaimUnpaidOnly(e.target.checked)} /> 미수만 보기
+              </label>
+            </div>
+            <div className="grid grid-cols-2 gap-3 p-4">
+              <BizStat label="미수 잔액" value={`₩${fmt(unpaidTotal)}`} tone="rose" />
+              <BizStat label="수금 완료" value={`₩${fmt(paidTotal)}`} tone="emerald" />
+            </div>
+            {shown.length === 0 ? (
+              <p className="text-sm text-slate-400 text-center py-8">{claimUnpaidOnly ? "미수 변상청구가 없습니다." : "변상청구 내역이 없습니다."}</p>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {shown.map((c) => (
+                  <div key={c.id} className="px-4 py-2.5 flex items-center justify-between gap-3 text-sm">
+                    <div className="min-w-0">
+                      <span className="font-medium">{c.customerName || "—"}</span>
+                      <span className="text-slate-400 text-xs ml-2">{c.locName} · {fmtD(c.date)}</span>
+                      {c.paid && c.paidDate && <span className="text-[10px] text-emerald-600 ml-2">수금 {fmtD(c.paidDate)}</span>}
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0">
+                      <span className="tabular-nums font-semibold">₩{fmt(c.total)}</span>
+                      <button onClick={() => toggleClaimPaid(c.id)}
+                        className={`text-xs rounded-lg px-2.5 py-1 font-medium ring-1 ${c.paid ? "bg-emerald-50 text-emerald-700 ring-emerald-200" : "bg-white text-slate-600 ring-slate-300 hover:bg-slate-50"}`}>
+                        {c.paid ? "✓ 수금 완료" : "수금 체크"}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="px-4 py-2.5 text-[11px] text-slate-400 border-t border-slate-100">※ 변상청구 발생액 표시·수금 관리용입니다. 회계 미수금 분개는 청구 발생 기준 그대로이며, 수금 체크는 회계에 반영되지 않습니다.</p>
+          </Card>
+        );
+      })()}
+
       <Card className="p-4 bg-slate-50/60">
         <div className="flex gap-2 text-slate-500 text-xs leading-relaxed">
           <AlertTriangle size={15} className="shrink-0 mt-0.5 text-amber-500" />
@@ -2092,26 +2469,22 @@ const Stat = ({ label, v, tone }) => {
 function JournalTable({ lines }) {
   if (!lines || lines.length === 0) return <p className="text-sm text-slate-400 py-4 text-center">해당 월 인식할 항목이 없습니다.</p>;
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-sm">
-        <thead className="text-slate-400 text-xs text-left border-b border-slate-100">
-          <tr><th className="py-2 font-medium">차변 계정</th><th className="py-2 font-medium text-right">차변</th>
-            <th className="py-2 font-medium pl-6">대변 계정</th><th className="py-2 font-medium text-right">대변</th></tr>
-        </thead>
-        <tbody>
-          {lines.map((l, i) => (
-            <React.Fragment key={i}>
-              <tr><td colSpan={4} className={`text-[13px] font-bold text-slate-800 ${i === 0 ? "pt-1" : "pt-4"} pb-1`}>{l.memo}</td></tr>
-              <tr className="border-b border-slate-100">
-                <td className="py-1.5">{l.debit.account}</td>
-                <td className="py-1.5 text-right tabular-nums font-medium">{fmt(l.debit.amount)}</td>
-                <td className="py-1.5 pl-6 text-slate-500">{l.credit.account}</td>
-                <td className="py-1.5 text-right tabular-nums font-medium">{fmt(l.credit.amount)}</td>
-              </tr>
-            </React.Fragment>
-          ))}
-        </tbody>
-      </table>
+    <div className="space-y-2.5">
+      {lines.map((l, i) => (
+        <div key={i} className="rounded-lg ring-1 ring-slate-200 overflow-hidden">
+          <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-100 text-[13px] font-bold text-slate-800">{l.memo}</div>
+          <div className="px-4 py-3 space-y-2 text-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-700">{l.debit.account}</span>
+              <span className="tabular-nums font-semibold">₩{fmt(l.debit.amount)}</span>
+            </div>
+            <div className="flex items-center justify-between text-slate-500">
+              <span className="pl-6">{l.credit.account}</span>
+              <span className="tabular-nums">₩{fmt(l.credit.amount)}</span>
+            </div>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
