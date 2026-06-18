@@ -628,7 +628,7 @@ function EmptyState({ onSample }) {
 
 /* ---------- 대시보드 ---------- */
 function Dashboard({ acc, period, totalTags, issuedTags, data, inventory, storeMap }) {
-  const { items, stores, customers, contracts, transactions, currencies, fxRates } = data;
+  const { items, stores, customers, contracts, transactions, currencies, fxRates, claims } = data;
   const warehouseTags = totalTags - issuedTags;
   const activeCt = contracts.filter((c) => isActiveContract(c, period)).length;
   const [chartMode, setChartMode] = useState("month");
